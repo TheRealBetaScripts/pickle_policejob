@@ -1,0 +1,725 @@
+if not Config.Evidence.enabled then return end
+
+local BulletTimeout = {}
+local Evidence = {}
+local VehiclePrints = {}
+local CachedDNA = {}
+local GSRTracking = {}
+local AwaitedDNA = {}
+
+-- Set Config.Evidence.photoDebug = false to silence photo diagnostics.
+local function PhotoDebug(id, message)
+    if Config.Evidence.photoDebug == false then return end
+    local safe = tostring(message):gsub('https?://%S+', '[URL REDACTED]')
+        :gsub('[%w_%-%.]+', function(word)
+            return #word > 24 and '[TOKEN REDACTED]' or word
+        end):gsub('[%c]', ' '):sub(1, 600)
+    print(('[pickle_policejob][PHOTO DEBUG][%s] %s'):format(tostring(id), safe))
+end
+
+-- Images upload directly using a temporary URL; the API key stays on the server.
+local ActivePhotos = {}
+local LastPhoto = {}
+lib.callback.register('pickle_policejob:evidence:capturePhoto', function(source)
+    local trace = tostring(source) .. '-' .. tostring(GetGameTimer())
+    local began = GetGameTimer()
+    PhotoDebug(trace, 'Server received photo request; screenshot-basic=' .. GetResourceState('screenshot-basic'))
+    if not IsPlayerOnDuty(source) then PhotoDebug(trace, 'Rejected: off duty') return { error = 'You must be on duty.' } end
+    if ActivePhotos[source] then PhotoDebug(trace, 'Rejected: upload already active') return { error = 'A photo is already being uploaded.' } end
+    local now = GetGameTimer()
+    if LastPhoto[source] and now - LastPhoto[source] < 2000 then PhotoDebug(trace, 'Rejected: request cooldown') return { error = 'Please wait before taking another photo.' } end
+    local photos = ConfigSV and ConfigSV.Photos
+    local key = photos and (photos.apiKey or (photos.headers or {}).Authorization
+        or (type(photos.url) == 'string' and photos.url:match('[?&]apiKey=([^&]+)')))
+    if type(key) ~= 'string' or key == '' then PhotoDebug(trace, 'Rejected: API key missing') return { error = 'Set ConfigSV.Photos.apiKey to your Fivemanage API key.' } end
+    if GetResourceState('screenshot-basic') ~= 'started' then PhotoDebug(trace, 'Rejected: screenshot-basic unavailable') return { error = 'screenshot-basic is not started.' } end
+    LastPhoto[source] = now
+    local pending = promise.new()
+    local job = { done = false, stage = 'Fivemanage authorization' }
+    ActivePhotos[source] = job
+    local function finish(result)
+        if job.done then PhotoDebug(trace, 'Ignoring late completion; stage=' .. job.stage) return end
+        PhotoDebug(trace, 'Completed after ' .. (GetGameTimer() - began) .. 'ms; stage=' .. job.stage .. '; result=' .. (result.error or 'success'))
+        job.done = true
+        if ActivePhotos[source] == job then ActivePhotos[source] = nil end
+        if result.error then print('[pickle_policejob] Photo upload failed: ' .. result.error) end
+        pending:resolve(result)
+    end
+    job.cancel = function() finish({ error = 'Player disconnected.' }) end
+    SetTimeout(45000, function() if not job.done then finish({ error = job.stage .. ' timed out.' }) end end)
+    SetTimeout(12000, function()
+        if not job.done and job.stage == 'Fivemanage authorization' then finish({ error = 'Fivemanage authorization timed out. Check server HTTPS access.' }) end
+    end)
+    PhotoDebug(trace, 'Requesting temporary upload URL; API key present; HTTPS GET')
+    local started, startError = pcall(function()
+        PerformHttpRequest('https://api.fivemanage.com/api/v3/file/presigned-url?expiresAt=' .. (os.time() + 120), function(status, body, responseHeaders, errorData)
+            if job.done then PhotoDebug(trace, 'Ignoring late completion; stage=' .. job.stage) return end
+            PhotoDebug(trace, 'Authorization response after ' .. (GetGameTimer() - began) .. 'ms; HTTP=' .. tostring(status) .. '; bodyBytes=' .. (type(body) == 'string' and #body or 0))
+            if type(status) ~= 'number' or status < 200 or status >= 300 then
+                PhotoDebug(trace, 'Authorization failure body=' .. tostring(body) .. '; transport=' .. tostring(errorData))
+                finish({ error = 'Fivemanage authorization returned HTTP ' .. tostring(status) .. '. Check API key and file upload permissions.' })
+                return
+            end
+            local ok, decoded = pcall(json.decode, body)
+            PhotoDebug(trace, 'Authorization JSON decoded=' .. tostring(ok) .. '; responseType=' .. type(decoded))
+            local url = ok and type(decoded) == 'table' and type(decoded.data) == 'table' and decoded.data.presignedUrl
+            if type(url) ~= 'string' or not (url:match('^https://fmapi%.net/api/v3/file/presigned%-url/[%w_.%-]+$')
+                or url:match('^https://api%.fivemanage%.com/api/v3/file/presigned%-url/[%w_.%-]+$')) then
+                PhotoDebug(trace, 'Invalid signing response: ' .. tostring(body))
+                finish({ error = 'Fivemanage returned an invalid temporary upload URL.' })
+                return
+            end
+            PhotoDebug(trace, 'Temporary URL validated; requesting client upload callback')
+            job.stage = 'Client screenshot/upload'
+            local requested, requestError = pcall(function()
+                lib.callback('pickle_policejob:evidence:uploadPhoto', source, function(result)
+                    if job.done then PhotoDebug(trace, 'Ignoring late completion; stage=' .. job.stage) return end
+                    PhotoDebug(trace, 'Client callback received after ' .. (GetGameTimer() - began) .. 'ms; type=' .. type(result))
+                    if type(result) ~= 'table' then finish({ error = 'Client screenshot/upload returned no result.' })
+                    elseif type(result.url) == 'string' and result.url:match('^https://%S+$') then finish({ url = result.url })
+                    elseif result.error == 'Client screenshot/upload timed out.' or result.error == 'Fivemanage upload failed.' or result.error == 'Could not start screenshot-basic upload.' or result.error == 'Camera is closed.' then finish({ error = result.error })
+                    else finish({ error = 'Client screenshot/upload failed. Check screenshot-basic and client F8 errors.' }) end
+                end, url, trace)
+            end)
+            if not requested then PhotoDebug(trace, 'Client callback exception: ' .. tostring(requestError)) finish({ error = 'Could not request client screenshot/upload.' }) end
+        end, 'GET', '', { Authorization = key })
+    end)
+    if not started then PhotoDebug(trace, 'HTTP request exception: ' .. tostring(startError)) finish({ error = 'Could not contact Fivemanage.' }) end
+    return Citizen.Await(pending)
+end)
+
+AddEventHandler('playerDropped', function()
+    local player = source
+    if ActivePhotos[player] then ActivePhotos[player].cancel() end
+    LastPhoto[player] = nil
+    BulletTimeout[player] = nil
+end)
+
+function EnsureEvidence(coords, evidenceType, data)
+    data.label = _L(evidenceType)
+    data.type = evidenceType
+    data.coords = coords
+    return data
+end
+
+function AddEvidence(coords, evidenceType, data)
+    local data = EnsureEvidence(coords, evidenceType, data)
+    if not data then return print("^1ERROR: CANT ADD EVIDENCE:^0", evidenceType, coords, data) end
+    for id, evidence in pairs(Evidence) do
+        if evidence.type == evidenceType and #(evidence.coords - coords) < Config.Evidence.evidenceGroupDistance then
+            if evidence.type == "shell_casing" then
+                evidence.amount = evidence.amount + 1
+                TriggerClientEvent("pickle_policejob:evidence:updateEvidence", -1, id, evidence)
+                return
+            elseif evidence.type == "blood" and evidence.identifier == data.identifier then
+                return
+            end
+        end
+    end
+    local id
+    repeat
+        id = math.random(1, 1000000)
+    until not Evidence[id]
+    Evidence[id] = data
+    TriggerClientEvent("pickle_policejob:evidence:addEvidence", -1, id, data)
+end
+
+exports("AddEvidence", AddEvidence)
+
+function GetAnyValue(table, keys)
+    if not table or type(table) ~= "table" then return end
+    for _, key in pairs(keys) do
+        if table[key] then
+            return table[key]
+        end
+    end
+end
+
+function CanCreateEvidence(coords)
+    for _, zone in pairs(Config.Evidence.evidenceExclusionZones or {}) do
+        if #(coords - zone.coords) < zone.radius then
+            return false
+        end
+    end
+    return true
+end
+
+function GetPlayerEvidence(source, isCreatingFile)
+    local inventory = Inventory.GetInventory(source)
+    local items = {}
+    local coords = GetEntityCoords(GetPlayerPed(source))
+    local heading = GetEntityHeading(GetPlayerPed(source))
+    for _, item in pairs(inventory) do
+        if item.name == "evidence_report" then
+            local evidence = item.metadata.evidence
+            for i=1, #evidence do
+                if evidence[i].coords then
+                    evidence[i].coords = {
+                        x = evidence[i].coords.x,
+                        y = evidence[i].coords.y,
+                        z = evidence[i].coords.z,
+                    }
+                end
+                if evidence[i].direction then
+                    evidence[i].direction = {
+                        x = evidence[i].direction.x,
+                        y = evidence[i].direction.y,
+                        z = evidence[i].direction.z,
+                    }
+                end
+            end
+            table.insert(items, {
+                name = item.name,
+                evidence = evidence,
+                slot = item.slot,
+            })
+        elseif not isCreatingFile then
+            item.evidence = {
+                {
+                    type = "item",
+                    label = item.label,
+                    image = item.image or (Config.ImageDirectory .. "/" .. item.name .. "." .. (Config.ImageExtension or "png")),
+                    time = os.time(),
+                    coords = coords,
+                    heading = heading,
+                    serial = GetAnyValue(item.metadata, {"serial", "serialnumber", "serial_number"}),
+                    item = {
+                        slot = item.slot,
+                    },
+                }
+            }
+            table.insert(items, {
+                name = item.name,
+                evidence = item.evidence,
+                slot = item.slot,
+            })
+        end
+    end
+    return items
+end
+
+function GetPlayerDNA(source)
+    if CachedDNA[source] then return CachedDNA[source] end
+    if AwaitedDNA[source] then return Citizen.Await(AwaitedDNA[source]) end
+    AwaitedDNA[source] = promise.new()
+    local identifier = GetIdentifier(source)
+    if not identifier or identifier == "" then
+        if AwaitedDNA[source] then AwaitedDNA[source]:resolve(nil); AwaitedDNA[source] = nil end
+        return nil
+    end
+    local result = MySQL.query.await("SELECT * FROM pickle_police_dna WHERE identifier = ?", {
+        identifier,
+    })
+    if not result[1] then 
+        local dna
+        repeat
+            dna = ""
+            for i=1, 6 do
+                local random = math.random(1, 2)
+                dna = dna .. string.char(random == 1 and math.random(65, 90) or math.random(48, 57))
+            end
+        until not MySQL.query.await("SELECT * FROM pickle_police_dna WHERE dna = ?", {
+            dna,
+        })[1]
+        MySQL.query("INSERT INTO pickle_police_dna (identifier, dna) VALUES (?, ?)", {
+            identifier,
+            dna,
+        })
+        result = {{dna = dna}}
+    end
+    CachedDNA[source] = result[1].dna
+    if AwaitedDNA[source] then
+        AwaitedDNA[source]:resolve(result[1].dna)
+        AwaitedDNA[source] = nil
+    end
+    return result[1].dna
+end
+
+function GetPlayerBAC(source)
+    if GetResourceState("envi_addictions") == "started" then
+        return (exports['envi-addictions']:Breathalyze(targetServerId) / 3) / 10
+    end
+    if ExternalStatus and ExternalStatus.Alcohol[source] then return ExternalStatus.Alcohol[source] or 0.0 end
+    if GetPlayerStatus(source) then
+        return GetPlayerStatus(source).Alcohol or 0.0
+    end
+    return 0.0
+end
+
+function GetPlayerBloodTest(source)
+    if GetResourceState("envi_addictions") == "started" then
+        return nil
+    end
+    if Config.Integrations.bloodTest and Config.Integrations.bloodTest.server then
+        return Config.Integrations.bloodTest.server(source)
+    end
+    return {}
+end
+
+function GetPlayerGSR(source)
+    if GSRTracking[source] and (GSRTracking[source] + Config.Evidence.gsrDuration) > os.time() then
+        return true
+    end
+    return false
+end
+
+function ConvertHTMLToPlaintext(html)
+    return html:gsub("<.->(.-)</.->", "%1"):gsub("<[^>]+>", ""):gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", "\""):gsub("&#39;", "'")
+end
+
+function CreateFile(source, file)
+    local result = MySQL.query.await("INSERT INTO pickle_police_files (departmentId, name, authorIdentifier, datetime, document, evidence) VALUES (?, ?, ?, ?, ?, ?)", {
+        GetPlayerDepartment(source),
+        file.name,
+        file.authorIdentifier,
+        file.datetime,
+        json.encode(file.document),
+        json.encode(file.evidence),
+    })
+    file.id = result.insertId
+    if Config.Integrations.evidence.fileCreated then
+        Config.Integrations.evidence.fileCreated(source, file.id, file)
+    end
+    return file.id, file
+end
+
+exports("CreateFile", CreateFile)
+
+function UpdateFile(source, id, file)
+    local result = MySQL.query.await("UPDATE pickle_police_files SET document = ?, evidence = ? WHERE id = ?", {
+        json.encode(file.document),
+        json.encode(file.evidence),
+        id,
+    })
+    if Config.Integrations.evidence.fileUpdated then
+        Config.Integrations.evidence.fileUpdated(source, id, file)
+    end
+    return file.id, file
+end
+
+exports("UpdateFile", UpdateFile)
+
+function DeleteFile(source, id)
+    local result = MySQL.query.await("DELETE FROM pickle_police_files WHERE id = ?", {
+        id,
+    })
+    if Config.Integrations.evidence.fileDeleted then
+        Config.Integrations.evidence.fileDeleted(source, id)
+    end
+end
+
+exports("DeleteFile", DeleteFile)
+
+exports("GetPlayerEvidence", GetPlayerEvidence)
+exports("GetPlayerDNA", GetPlayerDNA)
+exports("GetPlayerBAC", GetPlayerBAC)
+exports("GetPlayerBloodTest", GetPlayerBloodTest)
+exports("GetPlayerGSR", GetPlayerGSR)
+
+lib.callback.register("pickle_policejob:evidence:getFiles", function(source, search)
+    local result
+    if search == "" then
+        result = MySQL.query.await("SELECT * FROM pickle_police_files WHERE departmentId = ? ORDER BY datetime DESC LIMIT ?", {
+            GetPlayerDepartment(source),
+            Config.Evidence.maxFilesQuery,
+        })
+    else
+        result = MySQL.query.await("SELECT * FROM pickle_police_files WHERE departmentId = ? AND (name LIKE ? OR evidence LIKE ?) LIMIT ?", {
+            GetPlayerDepartment(source),
+            "%" .. search .. "%",
+            "%" .. search .. "%",
+            Config.Evidence.maxFilesQuery,
+        })
+    end
+    return result
+end)
+
+lib.callback.register("pickle_policejob:evidence:getEvidenceItems", function(source, isCreatingFile)
+    return GetPlayerEvidence(source, isCreatingFile)
+end)
+
+lib.callback.register("pickle_policejob:evidence:createFile", function(source, data)
+    local file = {
+        name = data.name,
+        authorIdentifier = GetIdentifier(source),
+        datetime = os.time(),
+        document = data.document,
+        evidence = data.evidence,
+    }
+    local _, file = CreateFile(source, file)
+    ShowNotification(source, _L("file_created"))
+    return file
+end)
+
+lib.callback.register("pickle_policejob:evidence:deleteEvidenceItem", function(source, name, slot)
+    local p = promise.new()
+    Inventory.RemoveItem(source, name, 1, slot)
+    SetTimeout(100, function()
+        p:resolve(true)
+    end)
+    Citizen.Await(p)
+    ShowNotification(source, _L("evidence_item_deleted"))
+    return GetPlayerEvidence(source)
+end)
+
+lib.callback.register("pickle_policejob:evidence:getBAC", function(source, target)
+    return GetPlayerBAC(target)
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:addBAC", function(target, bac)
+    local source = source
+    Inventory.AddItem(source, "evidence_report", 1, {
+        evidenceType = "bac",
+        evidence = {
+            {
+                type = "bac",
+                label = _L("breathalyzer_results"),
+                identifier = GetPlayerDNA(target),
+                image = "nui://pickle_policejob/nui/images/bac.png",
+                time = os.time(),
+                coords = GetEntityCoords(GetPlayerPed(target)),
+                heading = GetEntityHeading(GetPlayerPed(target)),
+                bac = bac,
+            }
+        },
+    })
+    ShowNotification(source, _L("bac_added"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:addBloodTest", function(target, results)
+    local source = source
+    Inventory.AddItem(source, "evidence_report", 1, {
+        evidenceType = "blood_test",
+        evidence = {
+            {
+                type = "blood_test",
+                label = _L("blood_test_results"),
+                identifier = GetPlayerDNA(target),
+                image = "nui://pickle_policejob/nui/images/blood_test.png",
+                time = os.time(),
+                coords = GetEntityCoords(GetPlayerPed(target)),
+                heading = GetEntityHeading(GetPlayerPed(target)),
+                results = results,
+            }
+        },
+    })
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:addShellCasing", function(data)
+    local source = source
+    -- Leave room for network jitter between the client's regularly queued batches.
+    -- Rejected batches are rate limiting, not photo/inventory errors.
+    local now = GetGameTimer()
+    if BulletTimeout[source] and now < BulletTimeout[source] then return end
+    if not CanCreateEvidence(data.origin) then return end
+    local interval = math.max(1, math.floor(1000 * Config.Evidence.queueInterval))
+    local tolerance = math.min(250, math.floor(interval / 4))
+    BulletTimeout[source] = now + interval - tolerance
+    GSRTracking[source] = os.time()
+    TriggerClientEvent("pickle_policejob:evidence:setHasGSR", source, true)
+    AddEvidence(data.origin, "shell_casing", {
+        identifier = GetPlayerDNA(source),
+        coords = data.origin,
+        time = os.time(),
+        direction = data.direction,
+        heading = data.heading,
+        weaponGroup = data.weaponGroup,
+        type = "shell_casing",
+        amount = data.amount,
+    })
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:pickupEvidence", function(id)
+    local source = source
+    local evidence = Evidence[id]
+    if not evidence then return print("^1ERROR: EVIDENCE NOT FOUND:^0", id) end
+    Evidence[id] = nil
+    TriggerClientEvent("pickle_policejob:evidence:removeEvidence", -1, id)
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:addBlood", function()
+    local source = source
+    if not CanCreateEvidence(GetEntityCoords(GetPlayerPed(source)) - vector3(0.0, 0.0, 1.0)) then return end
+    AddEvidence(GetEntityCoords(GetPlayerPed(source)) - vector3(0.0, 0.0, 1.0), "blood", {
+        identifier = GetPlayerDNA(source),
+        time = os.time(),
+        heading = 0.0,
+    })
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:addVehiclePrint", function(vehicleNetId, seatIndex)
+    local source = source
+    if not VehiclePrints[vehicleNetId] then
+        VehiclePrints[vehicleNetId] = {}
+    end
+    VehiclePrints[vehicleNetId][seatIndex] = {
+        identifier = GetPlayerDNA(source),
+        time = os.time(),
+    }
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:saveEvidence", function(evidenceType, evidence)
+    local source = source
+    Inventory.AddItem(source, "evidence_report", 1, {
+        evidenceType = evidenceType,
+        evidence = evidence,
+    })
+    ShowNotification(source, _L("evidence_saved"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:updateFileDocument", function(id, content)
+    local source = source
+    local departmentId = GetPlayerDepartment(source)
+    if not departmentId then return print("^1ERROR: NOT AUTHORIZED:^0", id) end
+    local result = MySQL.query.await("SELECT * FROM pickle_police_files WHERE id = ?", {
+        id,
+    })
+    if not result[1] then return print("^1ERROR: FILE NOT FOUND:^0", id) end
+    local file = result[1]
+    if file.departmentId ~= departmentId then return print("^1ERROR: NOT AUTHORIZED:^0", id) end
+    file.document = json.decode(file.document)
+    file.document.content = content
+    MySQL.query("UPDATE pickle_police_files SET document = ? WHERE id = ?", {
+        json.encode(file.document),
+        id,
+    })
+    if Config.Integrations.evidence.fileUpdated then
+        Config.Integrations.evidence.fileUpdated(source, id, file)
+    end
+    SendComputerEvent("pickle_policejob:evidence:updateFile", {
+        id = id,
+        file = file,
+    })
+    ShowNotification(source, _L("file_document_updated"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:importEvidence", function(id, importedEvidence)
+    local source = source
+    local departmentId = GetPlayerDepartment(source)
+    if not departmentId then return print("^1ERROR: NOT AUTHORIZED:^0", id) end
+    local result = MySQL.query.await("SELECT * FROM pickle_police_files WHERE id = ? AND departmentId = ?", {
+        id,
+        departmentId,
+    })
+    if not result[1] then return print("^1ERROR: FILE NOT FOUND:^0", id) end
+    local file = result[1]
+    local evidence = json.decode(file.evidence)
+    for i=1, #importedEvidence do
+        local canAdd = true
+        if importedEvidence[i].type == "item" and importedEvidence[i].item.slot then
+            local slot = importedEvidence[i].item.slot
+            local inventory = Inventory.GetInventory(source) or {}
+            local found = false
+            for _, item in pairs(inventory) do
+                if item.slot == slot then
+                    importedEvidence[i].item = item
+                    found = true
+                    break
+                end
+            end
+            if found then
+                Inventory.RemoveItem(source, importedEvidence[i].item.name, importedEvidence[i].item.count, slot)
+            else
+                canAdd = false
+            end
+        end
+        if canAdd then
+            table.insert(evidence, importedEvidence[i])
+        end
+    end
+    file.evidence = evidence
+    if Config.Integrations.evidence.fileUpdated then
+        Config.Integrations.evidence.fileUpdated(source, id, file)
+    end
+    SendComputerEvent("pickle_policejob:evidence:updateFile", {
+        id = id,
+        file = file,
+    })
+    MySQL.query("UPDATE pickle_police_files SET evidence = ? WHERE id = ?", {
+        json.encode(file.evidence),
+        id,
+    })
+    ShowNotification(source, _L("evidence_imported"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:deleteEvidence", function(id, index)
+    local source = source
+    local departmentId, member = GetPlayerDepartment(source)
+    if not departmentId then return ShowNotification(source, _L("not_on_duty")) end
+    local result = MySQL.query.await("SELECT * FROM pickle_police_files WHERE id = ? AND departmentId = ?", {
+        id,
+        departmentId,
+    })
+    if not result[1] then return ShowNotification(source, _L("file_not_found")) end
+    local file = result[1]
+    file.evidence = json.decode(file.evidence)
+    local rank, rankIndex = GetDepartmentRank(departmentId, member)
+    if result[1].authorIdentifier ~= GetIdentifier(source) and rankIndex > 1 then return ShowNotification(source, _L("no_department_permission")) end
+    local evidence = file.evidence
+    if evidence[index].type == "item" then
+        Inventory.AddItem(source, evidence[index].item.name, evidence[index].item.count, evidence[index].item.metadata)
+    end
+    table.remove(evidence, index)
+    file.evidence = evidence
+    MySQL.query("UPDATE pickle_police_files SET evidence = ? WHERE id = ?", {
+        json.encode(file.evidence),
+        id,
+    })
+    if Config.Integrations.evidence.fileUpdated then
+        Config.Integrations.evidence.fileUpdated(source, id, file)
+    end
+    SendComputerEvent("pickle_policejob:evidence:updateFile", {
+        id = id,
+        file = file,
+    })
+    ShowNotification(source, _L("evidence_deleted"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:printFile", function(id)
+    local source = source
+    local result = MySQL.query.await("SELECT * FROM pickle_police_files WHERE id = ?", {
+        id,
+    })
+    if not result[1] then return print("^1ERROR: FILE NOT FOUND:^0", id) end
+    local file = {
+        name = result[1].name,
+        authorIdentifier = result[1].authorIdentifier,
+        datetime = result[1].datetime,
+        document = json.decode(result[1].document),
+        evidence = json.decode(result[1].evidence),
+    }
+    Inventory.AddItem(source, "police_report", 1, {
+        fileId = id,
+    })
+    ShowNotification(source, _L("file_printed"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:addFingerprint", function(targetId)
+    local source = source
+    if not IsPlayerOnDuty(source) then return ShowNotification(source, _L("not_on_duty")) end
+    Inventory.AddItem(source, "evidence_report", 1, {
+        evidenceType = "fingerprint",
+        evidence = {
+            {
+                type = "fingerprint",
+                label = _L("fingerprint"),
+                identifier = GetPlayerDNA(targetId),
+                image = "nui://pickle_policejob/nui/images/fingerprint.png",
+                time = os.time(),
+                coords = GetEntityCoords(GetPlayerPed(targetId)),
+                heading = GetEntityHeading(GetPlayerPed(targetId)),
+                name = GetPlayerCharacterName(targetId),
+            }
+        },
+    })
+    ShowNotification(source, _L("fingerprint_added"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:addGSR", function(targetId)
+    local source = source
+    if not IsPlayerOnDuty(source) then return ShowNotification(source, _L("not_on_duty")) end
+    Inventory.AddItem(source, "evidence_report", 1, {
+        evidenceType = "gsr",
+        evidence = {
+            {
+                type = "gsr",
+                label = _L("gsr"),
+                result = GetPlayerGSR(targetId) and _L("positive") or _L("negative"),
+                identifier = GetPlayerDNA(targetId),
+                image = "nui://pickle_policejob/nui/images/fingerprint.png",
+                time = os.time(),
+                coords = GetEntityCoords(GetPlayerPed(targetId)),
+                heading = GetEntityHeading(GetPlayerPed(targetId)),
+                name = GetPlayerCharacterName(targetId),
+            }
+        },
+    })
+    ShowNotification(source, _L("gsr_added"))
+end)
+
+RegisterNetEvent("pickle_policejob:evidence:washOffGSR", function()
+    local source = source
+    GSRTracking[source] = nil
+    ShowNotification(source, _L("gsr_washed_off"))
+    TriggerClientEvent("pickle_policejob:evidence:setHasGSR", source, false)
+end)
+
+RegisterUsableItem("police_report", function(source, item, data)
+    local metadata = Config.FrameworkSettings.usableItemMetadata(item, data)
+    if not metadata or not metadata.fileId then return end
+    local result = MySQL.query.await("SELECT * FROM pickle_police_files WHERE id = ?", {
+        metadata.fileId,
+    })
+    if not result[1] then return print("^1ERROR: FILE NOT FOUND:^0", metadata.fileId) end
+    local file = {
+        id = result[1].id,
+        name = result[1].name,
+        authorIdentifier = result[1].authorIdentifier,
+        datetime = result[1].datetime,
+        document = json.decode(result[1].document),
+        evidence = json.decode(result[1].evidence),
+    }
+    TriggerClientEvent("pickle_policejob:evidence:viewFile", source, file)
+end)
+
+RegisterUsableItem("evidence_report", function(source, item, data)
+    local metadata = Config.FrameworkSettings.usableItemMetadata(item, data)
+    if not metadata then return end
+    ShowNotification(source, _L("evidence_report_used"))
+end)
+
+lib.callback.register("pickle_policejob:evidence:getVehicleInfo", function(source, vehicleNetId)
+    local entity = NetworkGetEntityFromNetworkId(vehicleNetId)
+    return {
+        coords = GetEntityCoords(entity),
+        heading = GetEntityHeading(entity),
+        plate = GetVehicleNumberPlateText(entity) or "UNKNOWN",
+        seats = VehiclePrints[vehicleNetId] or {},
+    }
+end)
+
+lib.callback.register("pickle_policejob:evidence:canPickupEvidence", function(source, id)
+    local source = source
+    local evidence = Evidence[id]
+    if not evidence then return ShowNotification(source, _L("evidence_not_found")) end
+    if evidence.time then
+        local timeLeft = (evidence.time + Config.Evidence.pickupCooldown) - os.time()
+        if timeLeft > 0 then return ShowNotification(source, _L("evidence_pickup_cooldown", timeLeft)) end
+    end
+    return true
+end)
+
+AddEventHandler('explosionEvent', function(sender, ev)
+    local coords = vector3(ev.posX, ev.posY, ev.posZ)
+    if not CanCreateEvidence(coords) then return end
+    AddEvidence(coords, "fire", {
+        explosionType = ev.explosionType,
+        identifier = GetPlayerDNA(sender),
+        heading = 0.0,
+    })
+end)
+
+AddEventHandler("entityRemoved", function(entity)
+    local vehicleNetId = NetworkGetNetworkIdFromEntity(entity)
+    if VehiclePrints[vehicleNetId] then 
+        VehiclePrints[vehicleNetId] = nil
+    end
+end)
+
+if Config.Evidence.evidenceRemove > 0 then
+    lib.cron.new("*/1 * * * *", function()
+        local removePack = {}
+        for id, evidence in pairs(Evidence) do
+            if evidence.time and (evidence.time + Config.Evidence.evidenceRemove) < os.time() then
+                Evidence[id] = nil
+                table.insert(removePack, id)
+            end
+        end
+        TriggerClientEvent("pickle_policejob:evidence:removeEvidence", -1, removePack)
+    end)
+end
+
+MySQL.ready(function()
+    MySQL.query("CREATE TABLE IF NOT EXISTS pickle_police_files (id INT AUTO_INCREMENT PRIMARY KEY, departmentId INT, name VARCHAR(255), authorIdentifier VARCHAR(255), datetime INT, document LONGTEXT, evidence LONGTEXT)")
+    MySQL.query("CREATE TABLE IF NOT EXISTS pickle_police_dna (identifier VARCHAR(255) NOT NULL PRIMARY KEY, dna VARCHAR(255) NOT NULL UNIQUE)")
+end)

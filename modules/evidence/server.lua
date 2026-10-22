@@ -7,102 +7,82 @@ local CachedDNA = {}
 local GSRTracking = {}
 local AwaitedDNA = {}
 
--- Photo upload relay ---------------------------------------------------------
--- Keeps ConfigSV.Photos.url (and any embedded API key) on the server.
--- The client sends the raw image bytes here; the server forwards them to the
--- configured upload endpoint and returns the resulting public URL.
+-- Images upload directly using a temporary URL; the API key stays on the server.
+local ActivePhotos = {}
+local LastPhoto = {}
+lib.callback.register('pickle_policejob:evidence:capturePhoto', function(source)
+    local trace = tostring(source) .. '-' .. tostring(GetGameTimer())
 
-local PendingPhotoUploads = {} -- [token] = promise
+    if not IsPlayerOnDuty(source) then  return { error = 'You must be on duty.' } end
+    if ActivePhotos[source] then  return { error = 'A photo is already being uploaded.' } end
+    local now = GetGameTimer()
+    if LastPhoto[source] and now - LastPhoto[source] < 2000 then  return { error = 'Please wait before taking another photo.' } end
+    local photos = ConfigSV and ConfigSV.Photos
+    local key = photos and (photos.apiKey or (photos.headers or {}).Authorization
+        or (type(photos.url) == 'string' and photos.url:match('[?&]apiKey=([^&]+)')))
+    if type(key) ~= 'string' or key == '' then  return { error = 'Set ConfigSV.Photos.apiKey to your Fivemanage API key.' } end
 
-local function GenerateUploadToken()
-    local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    local token = ""
-    for i = 1, 32 do
-        local idx = math.random(1, #chars)
-        token = token .. chars:sub(idx, idx)
+    LastPhoto[source] = now
+    local pending = promise.new()
+    local job = { done = false, stage = 'Fivemanage authorization' }
+    ActivePhotos[source] = job
+    local function finish(result)
+        if job.done then  return end
+
+        job.done = true
+        if ActivePhotos[source] == job then ActivePhotos[source] = nil end
+        if result.error then print('[pickle_policejob] Photo upload failed: ' .. result.error) end
+        pending:resolve(result)
     end
-    return token
-end
-
--- HTTP handler: receives image bytes from screenshot-basic on the client,
--- forwards them to the configured upload URL, and signals the waiting callback.
-SetHttpHandler(function(req, res)
-    if req.method ~= "POST" then
-        res.writeHead(405)
-        res.send("")
-        return
-    end
-
-    local token = req.path:match("^/photo%-upload/([%w]+)$")
-    if not token or not PendingPhotoUploads[token] then
-        res.writeHead(404)
-        res.send("")
-        return
-    end
-
-    local photos = ConfigSV.Photos
-    if not photos or photos.url == "FIVEMANAGE_UPLOAD_URL" then
-        res.writeHead(503)
-        res.send("")
-        PendingPhotoUploads[token]:resolve(nil)
-        PendingPhotoUploads[token] = nil
-        return
-    end
-
-    -- Collect request body
-    local body = ""
-    req.setDataHandler(function(chunk)
-        body = body .. chunk
+    job.cancel = function() finish({ error = 'Player disconnected.' }) end
+    SetTimeout(55000, function() if not job.done then finish({ error = job.stage .. ' timed out.' }) end end)
+    SetTimeout(12000, function()
+        if not job.done and job.stage == 'Fivemanage authorization' then finish({ error = 'Fivemanage authorization timed out. Check server HTTPS access.' }) end
     end)
 
-    req.setEndHandler(function()
-        -- Re-upload to the real endpoint using the same content-type so that
-        -- FiveManage (or any multipart-accepting host) receives a valid request.
-        local contentType = (req.headers and req.headers["content-type"]) or "application/octet-stream"
-        PerformHttpRequest(photos.url, function(statusCode, respBody, respHeaders)
-            local imageUrl = nil
-            if respBody and respBody ~= "" then
-                local ok, decoded = pcall(json.decode, respBody)
-                if ok and decoded then
-                    imageUrl = photos.ResponseHandler(decoded)
-                end
+    local started = pcall(function()
+        PerformHttpRequest('https://api.fivemanage.com/api/v3/file/presigned-url?expiresAt=' .. (os.time() + 120), function(status, body)
+            if job.done then  return end
+
+            if type(status) ~= 'number' or status < 200 or status >= 300 then
+
+                finish({ error = 'Fivemanage authorization returned HTTP ' .. tostring(status) .. '. Check API key and file upload permissions.' })
+                return
             end
-            if PendingPhotoUploads[token] then
-                PendingPhotoUploads[token]:resolve(imageUrl)
-                PendingPhotoUploads[token] = nil
+            local ok, decoded = pcall(json.decode, body)
+
+            local url = ok and type(decoded) == 'table' and type(decoded.data) == 'table' and decoded.data.presignedUrl
+            if type(url) ~= 'string' or not (url:match('^https://fmapi%.net/api/v3/file/presigned%-url/[%w_.%-]+$')
+                or url:match('^https://api%.fivemanage%.com/api/v3/file/presigned%-url/[%w_.%-]+$')) then
+
+                finish({ error = 'Fivemanage returned an invalid temporary upload URL.' })
+                return
             end
-        end, "POST", body, {["Content-Type"] = contentType})
 
-        -- Tell screenshot-basic the relay accepted the upload
-        res.writeHead(200, {["Content-Type"] = "application/json"})
-        res.send(json.encode({success = true}))
+            job.stage = 'Client screenshot/upload'
+            local requested = pcall(function()
+                lib.callback('pickle_policejob:evidence:uploadPhoto', source, function(result)
+                    if job.done then  return end
+
+                    if type(result) ~= 'table' then finish({ error = 'Client screenshot/upload returned no result.' })
+                    elseif type(result.url) == 'string' and result.url:match('^https://%S+$') then finish({ url = result.url })
+                    elseif type(result.error) == 'string' then finish({ error = result.error:gsub('https?://%S+', '[URL REDACTED]'):gsub('[%c]', ' '):sub(1, 200) })
+                    else finish({ error = 'Client screenshot/upload failed. Check client F8 photo diagnostics.' }) end
+                end, url, trace)
+            end)
+            if not requested then  finish({ error = 'Could not request client screenshot/upload.' }) end
+        end, 'GET', '', { Authorization = key })
     end)
+    if not started then  finish({ error = 'Could not contact Fivemanage.' }) end
+    return Citizen.Await(pending)
 end)
 
--- Callback: client asks for a one-time upload token, then uses it with
--- requestScreenshotUpload pointed at this resource's HTTP handler.
-lib.callback.register("pickle_policejob:evidence:getPhotoUploadToken", function(source)
-    if not IsPlayerOnDuty(source) then return nil end
-    local token = GenerateUploadToken()
-    PendingPhotoUploads[token] = promise.new()
-    -- Expire the token after 30 s to avoid leaks
-    SetTimeout(30000, function()
-        if PendingPhotoUploads[token] then
-            PendingPhotoUploads[token]:resolve(nil)
-            PendingPhotoUploads[token] = nil
-        end
-    end)
-    return token
+AddEventHandler('playerDropped', function()
+    local player = source
+    if ActivePhotos[player] then ActivePhotos[player].cancel() end
+    LastPhoto[player] = nil
+    BulletTimeout[player] = nil
 end)
-
--- Callback: after screenshot-basic has POSTed to our relay, the client calls
--- this to receive the final public image URL.
-lib.callback.register("pickle_policejob:evidence:awaitPhotoUrl", function(source, token)
-    local p = PendingPhotoUploads[token]
-    if not p then return nil end
-    return Citizen.Await(p)
-end)
--- End photo upload relay -----------------------------------------------------
 
 function EnsureEvidence(coords, evidenceType, data)
     data.label = _L(evidenceType)
@@ -219,7 +199,7 @@ function GetPlayerDNA(source)
     local result = MySQL.query.await("SELECT * FROM pickle_police_dna WHERE identifier = ?", {
         identifier,
     })
-    if not result[1] then 
+    if not result[1] then
         local dna
         repeat
             dna = ""
@@ -416,9 +396,14 @@ end)
 
 RegisterNetEvent("pickle_policejob:evidence:addShellCasing", function(data)
     local source = source
-    if BulletTimeout[source] and BulletTimeout[source] > os.time() then return print("^1ERROR: BULLET TIMEOUT:^0", source) end
+    -- Leave room for network jitter between the client's regularly queued batches.
+    -- Rejected batches are rate limiting, not photo/inventory errors.
+    local now = GetGameTimer()
+    if BulletTimeout[source] and now < BulletTimeout[source] then return end
     if not CanCreateEvidence(data.origin) then return end
-    BulletTimeout[source] = os.time() + Config.Evidence.queueInterval
+    local interval = math.max(1, math.floor(1000 * Config.Evidence.queueInterval))
+    local tolerance = math.min(250, math.floor(interval / 4))
+    BulletTimeout[source] = now + interval - tolerance
     GSRTracking[source] = os.time()
     TriggerClientEvent("pickle_policejob:evidence:setHasGSR", source, true)
     AddEvidence(data.origin, "shell_casing", {
@@ -705,7 +690,7 @@ end)
 
 AddEventHandler("entityRemoved", function(entity)
     local vehicleNetId = NetworkGetNetworkIdFromEntity(entity)
-    if VehiclePrints[vehicleNetId] then 
+    if VehiclePrints[vehicleNetId] then
         VehiclePrints[vehicleNetId] = nil
     end
 end)

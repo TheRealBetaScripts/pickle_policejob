@@ -8,6 +8,68 @@ local HIDE_EVIDENCE_MARKERS = false
 local CAMERA_EVIDENCE = {}
 local ReconstructScene
 
+-- Every request completes locally, including missing callbacks and resource errors.
+local function CaptureEvidencePhoto(callback)
+
+    local done = false
+    local function finish(result)
+        if done then return end
+        done = true
+
+        callback(result)
+    end
+    SetTimeout(60000, function() finish({ error = 'Photo request timed out. Please try again.' }) end)
+    local ok = pcall(function()
+        lib.callback('pickle_policejob:evidence:capturePhoto', false, function(result)
+            if type(result) ~= 'table' then result = { error = 'Photo capture failed.' } end
+            finish(result)
+        end)
+    end)
+    if not ok then  finish({ error = 'Could not request a photo.' }) end
+end
+
+-- The resource's own NUI captures and uploads the image; Lua receives only progress/results.
+local PendingPhoto
+RegisterNUICallback('evidencePhotoResult', function(data, cb)
+    cb({ ok = true })
+    if type(data) ~= 'table' or not PendingPhoto or data.id ~= PendingPhoto.id then return end
+    local job = PendingPhoto
+    if type(data.stage) == 'string' and ({ capture = true, encoding = true, upload = true, response = true })[data.stage] then
+        job.stage = data.stage
+
+    elseif type(data.url) == 'string' and data.url:match('^https://%S+$') then
+        job.finish({ url = data.url })
+    elseif type(data.error) == 'string' then
+        local message = data.error:gsub('https?://%S+', '[URL REDACTED]'):gsub('[%c]', ' '):sub(1, 200)
+        job.finish({ error = message })
+    end
+end)
+
+lib.callback.register('pickle_policejob:evidence:uploadPhoto', function(url, trace)
+    if not IN_EVIDENCE_CAMERA then return { error = 'Camera is closed.' } end
+    if PendingPhoto then return { error = 'A browser photo request is already active.' } end
+    if type(trace) ~= 'string' or not trace:match('^[%d%-]+$') then return { error = 'Invalid photo request ID.' } end
+    if type(url) ~= 'string' or not (url:match('^https://fmapi%.net/api/v3/file/presigned%-url/[%w_.%-]+$')
+        or url:match('^https://api%.fivemanage%.com/api/v3/file/presigned%-url/[%w_.%-]+$')) then return { error = 'Invalid upload URL.' } end
+    local pending = promise.new()
+    local job = { id = trace, stage = 'browser startup', done = false }
+    PendingPhoto = job
+    job.finish = function(result)
+        if job.done then return end
+        job.done = true
+        if PendingPhoto == job then PendingPhoto = nil end
+
+        pending:resolve(result)
+    end
+    SetTimeout(40000, function()
+        if job.done then return end
+        SendNUIMessage({ type = 'evidencePhotoCancel', id = trace })
+        job.finish({ error = 'Standalone photo timed out during ' .. job.stage .. '.' })
+    end)
+
+    SendNUIMessage({ type = 'evidencePhotoCapture', id = trace, url = url })
+    return Citizen.Await(pending)
+end)
 
 -- EVIDENCE CAMERA
 
@@ -56,6 +118,9 @@ function EquipEvidenceCamera()
     local playerPed = PlayerPedId()
     CreateThread(function()
         local cam = CreateCam("DEFAULT_SCRIPTED_FLY_CAMERA", true)
+        local session = {}
+        CAMERA_VALUES.session = session
+        CAMERA_VALUES.cam = cam
         AttachCamToEntity(cam, playerPed, 0.0, 1.0, 0.75, true)
         SetCamFov(cam, CAMERA_VALUES.calculatedFov)
         SetCamRot(cam, 0.0, 0.0, GetEntityHeading(playerPed), 2)
@@ -100,13 +165,12 @@ function EquipEvidenceCamera()
             DisableControlAction(0, 141, true) -- Disable melee attack heavy
             DisableControlAction(0, 142, true) -- Disable melee attack alternate
             DisableControlAction(0, 143, true) -- Disable melee block
-            
+
+            if IsControlJustPressed(0, 202) then break end
             if enableInteract then
-                if IsControlJustPressed(0, 202) then
-                    break
-                elseif IsDisabledControlJustPressed(0, 33) then
-                    if #CAMERA_EVIDENCE == 0 then 
-                        ShowNotification(_L("no_evidence_to_save")) 
+                if IsDisabledControlJustPressed(0, 33) then
+                    if #CAMERA_EVIDENCE == 0 then
+                        ShowNotification(_L("no_evidence_to_save"))
                     else
                         TriggerServerEvent("pickle_policejob:evidence:saveEvidence", "camera", CAMERA_EVIDENCE)
                         CAMERA_EVIDENCE = {}
@@ -114,31 +178,15 @@ function EquipEvidenceCamera()
                     end
                 elseif IsDisabledControlJustPressed(1, 51) then
                     enableInteract = false
-                    CreateThread(function()
-                        local p = promise.new()
-                        local token = lib.callback.await("pickle_policejob:evidence:getPhotoUploadToken", false)
-                        if token then
-                            local relayUrl = ("https://cfx-nui-%s/photo-upload/%s"):format(GetCurrentResourceName(), token)
-                            exports['screenshot-basic']:requestScreenshotUpload(relayUrl, "multipart", function(data)
-                                local imageUrl = lib.callback.await("pickle_policejob:evidence:awaitPhotoUrl", false, token)
-                                table.insert(CAMERA_EVIDENCE, {
-                                    type = "photo",
-                                    label = _L("photo"),
-                                    image = imageUrl,
-                                    coords = GetEntityCoords(playerPed),
-                                    heading = GetEntityHeading(playerPed),
-                                })
-                                SendNUIMessage({
-                                    type = "setCameraEvidence",
-                                    evidence = CAMERA_EVIDENCE,
-                                })
-                                p:resolve(true)
-                            end)
-                        else
-                            p:resolve(false)
-                        end
-                        Citizen.Await(p)
+                    CaptureEvidencePhoto(function(result)
                         enableInteract = true
+                        if not IN_EVIDENCE_CAMERA or CAMERA_VALUES.session ~= session then return end
+                        if not result.url then ShowNotification(result.error or 'Photo upload failed.') return end
+                        table.insert(CAMERA_EVIDENCE, {
+                            type = "photo", label = _L("photo"), image = result.url,
+                            coords = GetEntityCoords(playerPed), heading = GetEntityHeading(playerPed),
+                        })
+                        SendNUIMessage({ type = "setCameraEvidence", evidence = CAMERA_EVIDENCE })
                     end)
                 end
             end
@@ -181,7 +229,7 @@ function EquipEvidenceCamera()
                             cameraState = cameraState
                         })
                         SetTimeout(1000, function()
-                            if cameraState ~= nil then
+                            if IN_EVIDENCE_CAMERA and CAMERA_VALUES.session == session then
                                 cameraState = "idle"
                                 SendNUIMessage({
                                     type = "setCameraState",
@@ -190,47 +238,37 @@ function EquipEvidenceCamera()
                             end
                         end)
                         if targetVisible or isTargetVehicle then
-                            local p = promise.new()
+                            local evidenceId, vehicle = targetVisible, entity
+                            enableInteract = false
                             HIDE_EVIDENCE_MARKERS = true
                             CreateThread(function()
                                 Wait(100)
-                                local token = lib.callback.await("pickle_policejob:evidence:getPhotoUploadToken", false)
-                                if token then
-                                    local relayUrl = ("https://cfx-nui-%s/photo-upload/%s"):format(GetCurrentResourceName(), token)
-                                    exports['screenshot-basic']:requestScreenshotUpload(relayUrl, "multipart", function(data)
-                                        local image = lib.callback.await("pickle_policejob:evidence:awaitPhotoUrl", false, token)
-                                        if targetVisible then
-                                            local data = Evidence[targetVisible]
-                                            data.image = image
+                                CaptureEvidencePhoto(function(result)
+                                    if not IN_EVIDENCE_CAMERA or CAMERA_VALUES.session ~= session then return end
+                                    HIDE_EVIDENCE_MARKERS = false
+                                    enableInteract = true
+                                    if not result.url then ShowNotification(result.error or 'Photo upload failed.') return end
+                                    if evidenceId then
+                                        local original = Evidence[evidenceId]
+                                        if not original then ShowNotification('This evidence is no longer available.') return end
+                                        local data = {}
+                                        for key, value in pairs(original) do data[key] = value end
+                                        data.image = result.url
+                                        table.insert(CAMERA_EVIDENCE, data)
+                                        SendNUIMessage({ type = "setCameraEvidence", evidence = CAMERA_EVIDENCE })
+                                        TriggerServerEvent("pickle_policejob:evidence:pickupEvidence", evidenceId)
+                                    elseif DoesEntityExist(vehicle) then
+                                        lib.callback("pickle_policejob:evidence:getVehicleInfo", false, function(data)
+                                            if not IN_EVIDENCE_CAMERA or CAMERA_VALUES.session ~= session or type(data) ~= 'table' then return end
+                                            data.type = "vehicle"
+                                            data.model = GetEntityModel(vehicle)
+                                            data.label = _L("vehicle")
+                                            data.image = result.url
                                             table.insert(CAMERA_EVIDENCE, data)
-                                            SendNUIMessage({
-                                                type = "setCameraEvidence",
-                                                evidence = CAMERA_EVIDENCE,
-                                            })
-                                            p:resolve(true)
-                                        else
-                                            lib.callback("pickle_policejob:evidence:getVehicleInfo", false, function(data)
-                                                data.type = "vehicle"
-                                                data.model = GetEntityModel(entity)
-                                                data.label = _L("vehicle")
-                                                data.image = image
-                                                table.insert(CAMERA_EVIDENCE, data)
-                                                SendNUIMessage({
-                                                    type = "setCameraEvidence",
-                                                    evidence = CAMERA_EVIDENCE,
-                                                })
-                                                p:resolve(true)
-                                            end, VehToNet(entity))
-                                        end
-                                    end)
-                                else
-                                    p:resolve(false)
-                                end
-                                local success = Citizen.Await(p)
-                                HIDE_EVIDENCE_MARKERS = false
-                                if success and targetVisible then
-                                    TriggerServerEvent("pickle_policejob:evidence:pickupEvidence", targetVisible)
-                                end
+                                            SendNUIMessage({ type = "setCameraEvidence", evidence = CAMERA_EVIDENCE })
+                                        end, VehToNet(vehicle))
+                                    end
+                                end)
                             end)
                         end
                     end
@@ -243,6 +281,8 @@ function EquipEvidenceCamera()
 end
 
 function StopCameraLoop()
+    CAMERA_VALUES.session = nil
+    HIDE_EVIDENCE_MARKERS = false
     if not IN_EVIDENCE_CAMERA then return end
     if CAMERA_VALUES.obj then
         DeleteEntity(CAMERA_VALUES.obj)
@@ -256,7 +296,10 @@ function StopCameraLoop()
         cameraState = cameraState,
     })
     RenderScriptCams(false, false, 0, true, false)
-    DestroyCam(cam, false)
+    if CAMERA_VALUES.cam then
+        DestroyCam(CAMERA_VALUES.cam, false)
+        CAMERA_VALUES.cam = nil
+    end
     CAMERA_VALUES.calculatedFov = CAMERA_VALUES.fov[2]
 end
 
@@ -342,7 +385,7 @@ function GenerateEvidenceEntities(evidence)
                 SetEntityCoords(entity, coords)
                 baseHeading = baseHeading + ((math.random(1, 2) == 1 and 1 or -1) * math.random(5, 20))
             end
-            
+
             SetEntityHeading(entity, evidence.heading + baseHeading + rotation.z)
             FreezeEntityPosition(entity, true)
             PlaceObjectOnGroundProperly(entity)
@@ -504,7 +547,7 @@ end)
 
 RegisterNUICallback("getFiles", function(data, cb)
     lib.callback("pickle_policejob:evidence:getFiles", false, function(data)
-        local results = {}  
+        local results = {}
         for _, row in ipairs(data) do
             table.insert(results, {
                 id = row.id,
@@ -639,7 +682,7 @@ CreateThread(function()
     while true do
         local wait = 1500
         local playerPed = PlayerPedId()
-        if IsPedArmed(playerPed, 4) then
+        if not IN_EVIDENCE_CAMERA and IsPedArmed(playerPed, 4) then
             wait = 0
             if IsPedShooting(playerPed) then
                 local _, weaponHash = GetCurrentPedWeapon(playerPed)
@@ -734,7 +777,7 @@ AddEventHandler("onResourceStop", function(resource)
 end)
 
 AddEventHandler('gameEventTriggered', function (name, args)
-    if name == "CEventNetworkEntityDamage" then 
+    if name == "CEventNetworkEntityDamage" then
         local victim = args[1]
         local attacker = args[2]
         if victim ~= PlayerPedId() or not DoesEntityExist(attacker) then return end
@@ -751,4 +794,4 @@ AddEventHandler('gameEventTriggered', function (name, args)
         end
     end
 end)
-  
+
