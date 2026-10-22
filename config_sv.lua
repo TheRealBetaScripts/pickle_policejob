@@ -1,15 +1,13 @@
 ConfigSV = {}
 
--- Photo upload configuration (kept server-side to protect the API key)
+-- Server-only photo hosting. Replace the placeholder with a NEW image upload key.
 ConfigSV.Photos = {
-    -- FiveManage upload URL including your API key, e.g.:
-    -- "https://api.fivemanage.com/api/image?token=YOUR_API_KEY_HERE"
-    url = "FIVEMANAGE_UPLOAD_URL",
-    -- Upload protocol passed to screenshot-basic ("multipart" for FiveManage)
-    uploadProtocol = "multipart",
-    -- Parses the upload response and returns the public image URL
+    url = "https://fmapi.net/api/v2/image?apiKey=Yourkeyhere",
+    field = "file", -- Multipart form field name, not the word "multipart".
+    headers = {}, -- Optional Authorization header for hosts that require one.
     ResponseHandler = function(resp)
-        return resp and resp.url or nil
+        if type(resp) ~= 'table' or resp.success == false then return nil end
+        return (type(resp.data) == 'table' and resp.data.url) or resp.url
     end,
 }
 

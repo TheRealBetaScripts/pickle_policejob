@@ -13,10 +13,9 @@ files {
 	"nui/index.html",
 	"nui/images/*.*",
 	"nui/fonts/*.*",
-	"nui/sounds/*.*",
 	"nui/assets/**/*.*",
 	"nui/debug.js",
-	"components/**/*.*",
+    "nui/photo-capture.js",
 }
 
 shared_scripts {
@@ -36,10 +35,10 @@ client_scripts {
 
 server_scripts {
 	"@mysql-async/lib/MySQL.lua",
+	"config_sv.lua",
 	"bridge/**/**/server.lua",
 	"modules/**/server.lua",
     "core/server.lua",
-	"config_sv.lua",
 }
 
 
@@ -51,12 +50,17 @@ provides {
 lua54 'yes'
 
 escrow_ignore {
-	"config.lua",
-	"config_sv.lua",
-	"__INSTALL/**/*.*",
-	"core/*.*",
-	"bridge/**/**/*.*",
-	"bridge/**/*.*",
-    "locales/locale.lua",
-    "locales/translations/*.lua",
+    "config.lua",
+    "config_sv.lua",
+    '__INSTALL/**',
+    'bridge/**',
+    'locales/**',
+    'core/**',
+    'html/**',
+    'modules/**',
+    'nui/**',
+    'web/**',
 }
+
+dependency '/assetpacks'
+
